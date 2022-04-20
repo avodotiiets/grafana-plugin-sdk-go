@@ -32,6 +32,12 @@ type InstanceManager interface {
 	// updated, a new Instance is created and cached before returned.
 	Get(pluginContext backend.PluginContext) (Instance, error)
 
+	// GetWithKey returns an Instance by proding a key extractor function instead of default implementation.
+	//
+	// If Instance is cached and not updated it's returned. If Instance is not cached or
+	// updated, a new Instance is created and cached before returned.
+	GetWithKey(pluginContext backend.PluginContext, keyExtractor func(ctx backend.PluginContext) (interface{}, error)) (Instance, error)
+
 	// Do provides an Instance as argument to fn.
 	//
 	// If Instance is cached and not updated provides as argument to fn. If Instance is not cached or
@@ -78,6 +84,53 @@ type instanceManager struct {
 
 func (im *instanceManager) Get(pluginContext backend.PluginContext) (Instance, error) {
 	cacheKey, err := im.provider.GetKey(pluginContext)
+	if err != nil {
+		return nil, err
+	}
+	// Double-checked locking for update/create criteria
+	im.locker.RLock(cacheKey)
+	item, ok := im.cache.Load(cacheKey)
+	im.locker.RUnlock(cacheKey)
+
+	if ok {
+		ci := item.(CachedInstance)
+		needsUpdate := im.provider.NeedsUpdate(pluginContext, ci)
+
+		if !needsUpdate {
+			return ci.instance, nil
+		}
+	}
+
+	im.locker.Lock(cacheKey)
+	defer im.locker.Unlock(cacheKey)
+
+	if item, ok := im.cache.Load(cacheKey); ok {
+		ci := item.(CachedInstance)
+		needsUpdate := im.provider.NeedsUpdate(pluginContext, ci)
+
+		if !needsUpdate {
+			return ci.instance, nil
+		}
+
+		if disposer, valid := ci.instance.(InstanceDisposer); valid {
+			disposer.Dispose()
+		}
+	}
+
+	instance, err := im.provider.NewInstance(pluginContext)
+	if err != nil {
+		return nil, err
+	}
+	im.cache.Store(cacheKey, CachedInstance{
+		PluginContext: pluginContext,
+		instance:      instance,
+	})
+
+	return instance, nil
+}
+
+func (im *instanceManager) GetWithKey(pluginContext backend.PluginContext, keyExtractor func(ctx backend.PluginContext) (interface{}, error)) (Instance, error) {
+	cacheKey, err := keyExtractor(pluginContext)
 	if err != nil {
 		return nil, err
 	}
